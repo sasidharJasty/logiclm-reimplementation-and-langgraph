@@ -1,4 +1,3 @@
-{"id":"lp_valid_01","pipeline":"LP","solver":"Pyke","dataset":"ProofWriter","text":"Mira is kind. Kind people are friendly. Is Mira friendly?","facts":["Kind(Mira, True)"],"rules":[["Kind(person, True)"],"Friendly(person, True)"],"query":"Friendly(Mira, True)","expected_proved":true}
-{"id":"fol_valid_01","pipeline":"FOL","solver":"Prover9","dataset":"FOLIO","text":"Every human is mortal. Socrates is human. Is Socrates mortal?","formulation":"human(x) -> mortal(x). human(socrates).","goal":"mortal(socrates).","expected_proved":true}
-{"id":"csp_valid_01","pipeline":"CSP","solver":"python-constraint","dataset":"LogicalDeduction","text":"Alice and Bob each choose a number from 1 to 3, and Alice's number is less than Bob's. What values can Alice have?","variables":[{"name":"Alice","domain":[1,2,3]},{"name":"Bob","domain":[1,2,3]}],"constraints":[{"type":"function","variables":["Alice","Bob"],"expression":"Alice < Bob"}],"query":{"variables":["Alice"]},"type":"all"}
-{"id":"sat_valid_01","pipeline":"SAT","solver":"Z3","dataset":"AR-LSAT","text":"At least one of Ada or Ben repairs the radio, but not both.","variables":["repairs_Ada","repairs_Ben"],"formulation":"Xor(repairs_Ada, repairs_Ben)","expected_satisfiable":true}
+version https://git-lfs.github.com/spec/v1
+oid sha256:269536dbbd389ecc38b30bf5a48f0750364ca3d0a2bd54b44d0f5ff8ea1f436a
+size 1233
