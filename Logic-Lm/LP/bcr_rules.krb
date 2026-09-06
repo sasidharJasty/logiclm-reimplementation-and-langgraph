@@ -1,0 +1,38 @@
+# Derive parent relationships
+
+father_of
+    use parent($child, $father, father)
+    when
+        bcr_facts.son_of($child, $father, $mother)
+
+father_of_daughter
+    use parent($child, $father, father)
+    when
+        bcr_facts.daughter_of($child, $father, $mother)
+
+mother_of_son
+    use parent($child, $mother, mother)
+    when
+        bcr_facts.son_of($child, $father, $mother)
+
+mother_of_daughter
+    use parent($child, $mother, mother)
+    when
+        bcr_facts.daughter_of($child, $father, $mother)
+
+
+# Derive sibling relationships
+
+brothers
+    use sibling($brother1, $brother2)
+    when
+        bcr_facts.son_of($brother1, $father, $mother)
+        bcr_facts.son_of($brother2, $father, $mother)
+        check $brother1 != $brother2
+
+sisters
+    use sibling($sister1, $sister2)
+    when
+        bcr_facts.daughter_of($sister1, $father, $mother)
+        bcr_facts.daughter_of($sister2, $father, $mother)
+        check $sister1 != $sister2

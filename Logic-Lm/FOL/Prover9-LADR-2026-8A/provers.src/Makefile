@@ -1,0 +1,224 @@
+# LADR/prover9.src
+
+CC = gcc
+
+# XFLAGS can be specified on the command line (see XFLAGS below)
+
+# Detect OS and set platform-specific flags
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    # macOS: detect Darwin version and set appropriate architectures
+    # Darwin 20+ (macOS 11+): arm64 + x86_64
+    # Darwin 18-19 (macOS 10.14-10.15): x86_64 only (32-bit SDK dropped)
+    # Darwin 10-17 (macOS 10.6-10.13): i386 + x86_64
+    # Darwin 9 (macOS 10.5): ppc + i386 + x86_64
+    # Darwin 8 (macOS 10.4) Intel: ppc + i386 (no x86_64 support)
+    # Darwin 8 (macOS 10.4) PPC: ppc only (cannot cross-compile i386)
+    # Darwin <8 (macOS 10.3 and earlier): ppc only
+    # Override: make all PLATFORM_FLAGS="-arch ppc"
+    DARWIN_MAJOR := $(shell uname -r | cut -d. -f1)
+    PLATFORM_FLAGS := $(shell \
+        v=$(DARWIN_MAJOR); \
+        if [ $$v -ge 20 ]; then \
+            echo "-arch arm64 -arch x86_64"; \
+        elif [ $$v -ge 18 ]; then \
+            echo "-arch x86_64"; \
+        elif [ $$v -ge 10 ]; then \
+            echo "-arch i386 -arch x86_64"; \
+        elif [ $$v -ge 9 ]; then \
+            echo "-arch ppc -arch i386 -arch x86_64"; \
+        elif [ $$v -ge 8 ]; then \
+            p=`uname -p`; \
+            if [ "$$p" = "i386" ]; then \
+                echo "-arch ppc -arch i386"; \
+            else \
+                echo "-arch ppc"; \
+            fi; \
+        else \
+            echo "-arch ppc"; \
+        fi)
+    # Use libtool for fat libraries (ar can't handle fat .o files)
+    AR_CMD = libtool -static -o
+else
+    # Linux and others: no special flags
+    PLATFORM_FLAGS =
+    AR_CMD = $(AR) rs
+endif
+
+ifdef DEBUG
+  OPTFLAGS = -g -O0 -DDEBUG
+  _BMODE = debug
+else
+  ifdef NATIVE
+    OPTFLAGS = -O3 -march=native -flto
+    PLATFORM_FLAGS =
+    AR_CMD = $(AR) rs
+    ifdef PGO
+      ifeq ($(PGO),gen)
+        OPTFLAGS += -fprofile-generate=$(CURDIR)/../pgo_data
+        _BMODE = native-pgo-gen
+      endif
+      ifeq ($(PGO),use)
+        OPTFLAGS += -fprofile-use=$(CURDIR)/../pgo_data
+        _BMODE = native-pgo-use
+      endif
+    else
+      _BMODE = native
+    endif
+  else
+    OPTFLAGS = -O2
+    _BMODE = release
+  endif
+endif
+MMD_TEST := $(shell rm -f /tmp/_mmd_test.o /tmp/_mmd_test.d; echo 'int x;' | $(CC) $(PLATFORM_FLAGS) -MMD -MP -x c -c - -o /tmp/_mmd_test.o 2>/dev/null && echo "-MMD -MP"; rm -f /tmp/_mmd_test.o /tmp/_mmd_test.d)
+# Test for open_memstream (POSIX.1-2008; missing on macOS < 10.13).
+# Omit PLATFORM_FLAGS: universal-binary -arch flags cause link failure
+# even when open_memstream is available natively.
+# Declare the real (non-empty-parens) prototype directly rather than
+# #include <stdio.h>: a bare "open_memstream()" forward declaration
+# (empty parens) compiled fine as "unspecified arguments" on older
+# compilers, but newer GCC (C23-leaning defaults, e.g. GCC 15) treats
+# empty parens as "takes no arguments" -- the real 2-argument call then
+# fails to compile, this test spuriously reports "not available", and
+# the entire -cores forking mechanism silently compiles out with no
+# runtime error at all (root cause of a real -cores-does-nothing report).
+# Avoiding #include/#define here also sidesteps "#" being a Makefile
+# comment character that needs escaping inside a $(shell ...) call.
+HAS_OMS := $(shell echo 'void *open_memstream(char **, unsigned long *); int main(){char *b; unsigned long l; return open_memstream(&b,&l)==0;}' | $(CC) -x c - -o /tmp/_oms 2>/dev/null && echo yes; rm -f /tmp/_oms)
+ifneq ($(HAS_OMS),yes)
+  NO_OMS = -DNO_OPEN_MEMSTREAM
+endif
+# Test for libproc.h/proc_pidinfo (added in Mac OS X 10.5 Leopard; not
+# present on older Darwin/PowerPC toolchains -- __APPLE__ alone is not
+# a safe proxy for "this specific machine/SDK has it", found live
+# 2026-08-12 when a PowerBook G4 build failed outright on the #include
+# added the same week for -cores's per-child RSS check). \# needs
+# escaping here (unlike HAS_OMS above) because this test genuinely
+# needs a real #include, not just a hand-written prototype -- an
+# unescaped # would be read as a Makefile comment starting mid-line.
+HAS_LIBPROC := $(shell printf '\#include <libproc.h>\nint main(){struct proc_taskinfo info; return proc_pidinfo(1, PROC_PIDTASKINFO, 0, &info, sizeof(info));}\n' | $(CC) -x c - -o /tmp/_libproc 2>/dev/null && echo yes; rm -f /tmp/_libproc)
+ifneq ($(HAS_LIBPROC),yes)
+  NO_LIBPROC = -DNO_LIBPROC
+endif
+CFLAGS = $(OPTFLAGS) -Wall $(MMD_TEST) $(NO_OMS) $(NO_LIBPROC) $(PLATFORM_FLAGS) $(XFLAGS)
+ifdef STATIC
+  ifneq ($(UNAME_S),Darwin)
+    LDFLAGS = -static
+  endif
+endif
+
+# Build mode sentinel -- auto-clean when switching debug/release.
+.build_mode: FORCE
+	@echo "$(_BMODE) $(XFLAGS)" > .build_mode.tmp
+	@if [ ! -f .build_mode ] || ! cmp -s .build_mode.tmp .build_mode; then \
+	  echo "provers.src: build mode changed to $(_BMODE), rebuilding..."; \
+	  /bin/rm -f *.o; \
+	  mv .build_mode.tmp .build_mode; \
+	else \
+	  rm -f .build_mode.tmp; \
+	fi
+
+FORCE:
+
+PRVR_OBJ = index_lits.o forward_subsume.o demodulate.o\
+           pred_elim.o unfold.o semantics.o\
+	   giv_select.o white_black.o actions.o\
+	   search.o\
+	   utilities.o\
+	   provers.o\
+	   foffer.o\
+	   features.o dtree.o
+
+OBJECTS = $(PRVR_OBJ)
+
+# PROGRAMS = mprover iterate4
+
+PROGRAMS = prover9 fof-prover9 autosketches4 newauto newsax\
+	   ladr_to_tptp tptp_to_ladr
+
+##############################################################################
+
+all: $(PROGRAMS) install
+
+# libs is kept as a named manual entry point (`make libs`) but deliberately
+# NOT listed as a sibling of $(PROGRAMS) in `all` above -- under -j it raced
+# ladr's recursive submake against $(PROGRAMS)' own, separate resolution of
+# the raw ../ladr/libladr.a file prerequisite (two paths building the same
+# output). The file-level rule below serializes both through one path.
+libs: ladr libmace4
+
+ladr libladr:
+	cd ../ladr && $(MAKE) libladr
+
+libmace libmace4:
+	cd ../mace4.src && $(MAKE) libmace4
+
+# Any target below listing ../ladr/libladr.a as a prerequisite (all of
+# $(PROGRAMS)) correctly triggers ladr's recipe first via this rule --
+# without it, -j could run ladr and a program's link step as unrelated
+# siblings, letting the link start before libladr.a is ready.
+../ladr/libladr.a: ladr
+
+# Same reasoning for mprover/iterate4 below, which aren't in $(PROGRAMS)
+# (not built by `all`) but share the identical shape.
+../mace4.src/libmace4.a: libmace4
+
+install: $(PROGRAMS)
+	@for f in $(PROGRAMS); do \
+	  codesign -s - -f "$$f" 2>/dev/null || true; \
+	  /bin/cp -p "$$f" ../bin; \
+	done
+
+clean:
+	/bin/rm -f *.o *.d
+
+realclean:
+	/bin/rm -f *.o *.d $(PROGRAMS) .build_mode
+
+protos:
+	util/make_protos $(OBJECTS)
+
+dep:
+	util/make_dep $(OBJECTS)
+
+tags:
+	etags *.c ../ladr/*.c
+
+prover:
+	/bin/rm -f prover9
+	$(MAKE) prover9
+
+prover9: .build_mode prover9.o $(OBJECTS) ../ladr/libladr.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o prover9 prover9.o $(OBJECTS) ../ladr/libladr.a -lm
+
+fof-prover9: fof-prover9.o $(OBJECTS) ../ladr/libladr.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o fof-prover9 fof-prover9.o $(OBJECTS) ../ladr/libladr.a -lm
+
+ladr_to_tptp: ladr_to_tptp.o $(OBJECTS) ../ladr/libladr.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o ladr_to_tptp ladr_to_tptp.o $(OBJECTS) ../ladr/libladr.a -lm
+
+tptp_to_ladr: tptp_to_ladr.o $(OBJECTS) ../ladr/libladr.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o tptp_to_ladr tptp_to_ladr.o $(OBJECTS) ../ladr/libladr.a -lm
+
+autosketches4: autosketches4.o $(OBJECTS) ../ladr/libladr.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o autosketches4 autosketches4.o $(OBJECTS) ../ladr/libladr.a -lm
+
+newauto: newauto.o $(OBJECTS) ../ladr/libladr.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o newauto newauto.o $(OBJECTS) ../ladr/libladr.a -lm
+
+newsax: newsax.o $(OBJECTS) ../ladr/libladr.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o newsax newsax.o $(OBJECTS) ../ladr/libladr.a -lm
+
+cgrep: cgrep.o $(OBJECTS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o cgrep cgrep.o $(OBJECTS) ../ladr/libladr.a
+
+mprover: mprover.o $(OBJECTS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o mprover mprover.o $(OBJECTS) ../ladr/libladr.a ../mace4.src/libmace4.a
+
+iterate4: iterate4.o $(OBJECTS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o iterate4 iterate4.o $(OBJECTS) ../ladr/libladr.a
+
+DEPS := $(wildcard *.d)
+ifneq ($(DEPS),)
+-include $(DEPS)
+endif

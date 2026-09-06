@@ -1,0 +1,1649 @@
+/*  Copyright (C) 2006, 2007 William McCune
+
+    This file is part of the LADR Deduction Library.
+
+    The LADR Deduction Library is free software; you can redistribute it
+    and/or modify it under the terms of the GNU General Public License,
+    version 2.
+
+    The LADR Deduction Library is distributed in the hope that it will be
+    useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with the LADR Deduction Library; if not, write to the Free Software
+    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+#include "unify.h"
+
+/* Private definitions and types */
+
+/* A Trail records substitutions so that they can be easily undone.
+ * Whenever a variable is instantiated (by making in entry in a
+ * Context), one of these nodes is prepended to the current trail.
+ */
+
+struct trail {
+  int     varnum;   /* index of instantiated variable */
+  Context context;  /* context of instanteated variable */
+  Trail   next;     /* next (earlier) member of trail */
+};
+
+/* bind a variable, record binding in a trail */
+
+#define BIND_TR(i, c1, t2, c2, trp) { struct trail *tr; \
+    c1->terms[i] = t2; c1->contexts[i] = c2; \
+    tr = get_trail(); tr->varnum = i; tr->context = c1; \
+    tr->next = *trp; *trp = tr; }
+
+#define MAX_MULTIPLIERS 500
+#define MULT_BITS_PER_WORD (8 * (int) sizeof(unsigned long long))
+#define MULT_WORDS ((MAX_MULTIPLIERS + MULT_BITS_PER_WORD - 1) / MULT_BITS_PER_WORD)
+
+/* Private variables */
+
+/* Bitset over multiplier ids: bit i set => multiplier i is in use.
+   Same "lowest free id first" allocation policy as the old linear scan
+   over Multipliers[MAX_MULTIPLIERS] (multiplier values feed into
+   variable renumbering elsewhere, so the assignment policy -- not just
+   determinism of the sequence -- must match exactly), but O(1) instead
+   of O(MAX_MULTIPLIERS): __builtin_ctzll finds the lowest zero bit in
+   the first word that has one. Bits >= MAX_MULTIPLIERS in the last word
+   are pre-set (see init below) so they are never handed out. */
+static unsigned long long Multiplier_words[MULT_WORDS];
+static BOOL Multiplier_words_init = FALSE;
+
+/*************
+ *
+ *   next_available_multiplier()
+ *
+ *************/
+
+static
+int next_available_multiplier()
+{
+  int w;
+
+  if (!Multiplier_words_init) {
+    int total_bits = MULT_WORDS * MULT_BITS_PER_WORD;
+    int extra = total_bits - MAX_MULTIPLIERS;  /* unused high bits, last word */
+    Multiplier_words_init = TRUE;
+    if (extra > 0)
+      Multiplier_words[MULT_WORDS-1] = ~0ULL << (MULT_BITS_PER_WORD - extra);
+  }
+
+  for (w = 0; w < MULT_WORDS; w++) {
+    unsigned long long avail = ~Multiplier_words[w];
+    if (avail != 0) {
+      int bit = __builtin_ctzll(avail);
+      Multiplier_words[w] |= (1ULL << bit);
+      return w * MULT_BITS_PER_WORD + bit;
+    }
+  }
+  fatal_error("next_available_multiplier, none available (infinite loop?).");
+  return -1;  /* to quiet compiler */
+}  /* next_available_multiplier */
+
+/*************
+ *
+ *   multiplier_in_use() / clear_multiplier()
+ *
+ *************/
+
+static
+BOOL multiplier_in_use(int i)
+{
+  return (Multiplier_words[i / MULT_BITS_PER_WORD] &
+	  (1ULL << (i % MULT_BITS_PER_WORD))) != 0;
+}  /* multiplier_in_use */
+
+static
+void clear_multiplier(int i)
+{
+  Multiplier_words[i / MULT_BITS_PER_WORD] &= ~(1ULL << (i % MULT_BITS_PER_WORD));
+}  /* clear_multiplier */
+
+/*
+ * memory management
+ */
+
+#define PTRS_CONTEXT PTRS(sizeof(struct context))
+static unsigned Context_gets, Context_frees;
+
+/* Private Context free list.  Recycled Contexts are guaranteed clean
+   (all terms[]/contexts[] slots NULL) because undo_subst/undo_subst_2
+   and btm/btu backtrack paths NULL every slot they write.  Reusing
+   from this list avoids the expensive memset-to-zero in get_cmem(). */
+static Context Context_freelist = NULL;
+
+#define PTRS_TRAIL PTRS(sizeof(struct trail))
+static unsigned Trail_gets, Trail_frees;
+
+/*************
+ *
+ *   Context get_context()
+ *
+ *************/
+
+/* DOCUMENTATION
+*/
+
+/* PUBLIC */
+Context get_context(void)
+{
+  Context p;
+  if (Context_freelist != NULL) {
+    /* Reuse a recycled Context -- already zeroed by undo_subst. */
+    p = Context_freelist;
+    Context_freelist = (Context) p->partial_term;  /* next pointer */
+    p->partial_term = NULL;
+  }
+  else {
+    /* First-time allocation: get_cmem zeroes the entire struct. */
+    p = get_cmem(PTRS_CONTEXT);
+  }
+  p->multiplier = next_available_multiplier();
+  Context_gets++;
+  return(p);
+}  /* get_context */
+
+/*************
+ *
+ *    free_context()
+ *
+ *************/
+
+/* DOCUMENTATION
+*/
+
+/* PUBLIC */
+void free_context(Context p)
+{
+  if (!multiplier_in_use(p->multiplier))
+    fatal_error("free_context, bad multiplier");
+  clear_multiplier(p->multiplier);
+  /* Push onto private free list instead of returning to palloc.
+     The Context is already clean (terms[]/contexts[] all NULL)
+     because callers undo all bindings before freeing. */
+  p->multiplier = -1;  /* mark as freed */
+  p->partial_term = (Term) Context_freelist;  /* next pointer */
+  Context_freelist = p;
+  Context_frees++;
+}  /* free_context */
+
+/*************
+ *
+ *   Trail get_trail()
+ *
+ *************/
+
+static
+Trail get_trail(void)
+{
+  Trail p = get_mem(PTRS_TRAIL);  /* uninitialized */
+  Trail_gets++;
+  return(p);
+}  /* get_trail */
+
+/*************
+ *
+ *    free_trail()
+ *
+ *************/
+
+static
+void free_trail(Trail p)
+{
+  free_mem(p, PTRS_TRAIL);
+  Trail_frees++;
+}  /* free_trail */
+
+/*************
+ *
+ *   fprint_unify_mem()
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine prints (to FILE *fp) memory usage statistics for data types
+associated with the unify package.
+The Boolean argument heading tells whether to print a heading on the table.
+*/
+
+/* PUBLIC */
+void fprint_unify_mem(FILE *fp, BOOL heading)
+{
+  int n;
+  if (heading)
+    fprintf(fp, "  type (bytes each)        gets      frees     in use      bytes\n");
+
+  n = sizeof(struct context);
+  fprintf(fp, "context (%4d)      %11u%11u%11u%9.1f K\n",
+          n, Context_gets, Context_frees,
+          Context_gets - Context_frees,
+          ((Context_gets - Context_frees) * n) / 1024.);
+
+  n = sizeof(struct trail);
+  fprintf(fp, "trail (%4d)        %11u%11u%11u%9.1f K\n",
+          n, Trail_gets, Trail_frees,
+          Trail_gets - Trail_frees,
+          ((Trail_gets - Trail_frees) * n) / 1024.);
+
+}  /* fprint_unify_mem */
+
+/*************
+ *
+ *   p_unify_mem()
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine prints (to stdout) memory usage statistics for data types
+associated with the unify package.
+*/
+
+/* PUBLIC */
+void p_unify_mem()
+{
+  fprint_unify_mem(stdout, 1);
+}  /* p_unify_mem */
+
+/*
+ *  end of memory management
+ */
+/*************
+ *
+ *   unify()
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine tries to unify two terms in their respective
+contexts.  Trail * trp is the address of a Trail.
+If successful, the trail is extended (at its front) with
+substitutions that were made, and trp is updated to point to
+the new beginning of the trail.  If unify fails, the Contexts and
+the Trail * are not changed.
+<P>
+You must make sure, before calling unify(), that no variable v in
+t1 or t2 has VARNUM(v) >= MAXVARS.  This is usually accomplished by
+calling a routine that renames variables.
+<P>
+Here is an example how to use unify(),
+apply(), and undo_subst().  Assume we have terms t1 and t2.
+(Terms t1 and t2 may share variables, but we "separate" the
+variables by using different contexts.  That is, variable v1 in
+context c1 is different from variable v1 in context c2.)
+<PRE>
+    {
+        Context c1 = get_context();
+        Context c2 = get_context();
+        Trail tr = NULL;
+        if (unify(t1, c1, t2, c2, &tr)) {
+            Term t3 = apply(t1, c1);
+            Term t4 = apply(t2, c2);
+            if (term_ident(t3, t4))
+                printf("everything is OK\n");
+            else
+                printf("something is broken\n");
+            undo_subst(tr);
+            zap_term(t3);
+            zap_term(t4);
+        }
+        else
+            printf("unify fails\n");
+        free_context(c1);
+        free_context(c2);
+    }
+</PRE>
+*/
+
+/* PUBLIC */
+BOOL unify(Term t1, Context c1,
+	   Term t2, Context c2, Trail *trp)
+{
+  /* Iterative unification using explicit stack.
+     On failure, restore trail to entry state and return FALSE. */
+  /* Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  typedef struct { Term t1; Term t2; Context c1; Context c2;
+                   int child; int arity; } Sframe;
+  Sframe sbo_buf[64];
+  Sframe *stack = sbo_buf;
+  int cap = 64;
+  int top = 0;
+  Trail entry_trail = *trp;
+  Term s1 = t1, s2 = t2;
+  Context sc1 = c1, sc2 = c2;
+
+  for (;;) {
+    DEREFERENCE(s1, sc1)
+    DEREFERENCE(s2, sc2)
+
+    if (VARIABLE(s1)) {
+      int vn1 = VARNUM(s1);
+      /* BIND_TR/DEREFERENCE index Context.terms[]/contexts[], sized
+         MAX_VARS; an out-of-range varnum (callers that unify terms
+         carrying apply()'s multiplier*MAX_VARS+VARNUM encoding
+         without renumbering first -- see term_has_oob_var's callers
+         in just.c) would read/write past the Context struct into
+         whatever heap memory follows it instead of a clean failure. */
+      if (vn1 >= MAX_VARS)
+        goto fail;
+      if (VARIABLE(s2)) {
+        if (VARNUM(s2) >= MAX_VARS)
+          goto fail;
+        if (!(vn1 == VARNUM(s2) && sc1 == sc2)) {
+          BIND_TR(vn1, sc1, s2, sc2, trp)
+        }
+      }
+      else {
+        if (!occur_check(vn1, sc1, s2, sc2))
+          goto fail;
+        BIND_TR(vn1, sc1, s2, sc2, trp)
+      }
+    }
+    else if (VARIABLE(s2)) {
+      int vn2 = VARNUM(s2);
+      if (vn2 >= MAX_VARS)
+        goto fail;
+      if (!occur_check(vn2, sc2, s1, sc1))
+        goto fail;
+      BIND_TR(vn2, sc2, s1, sc1, trp)
+    }
+    else if (SYMNUM(s1) != SYMNUM(s2)) {
+      goto fail;
+    }
+    else if (ARITY(s1) != ARITY(s2)) {
+      /* Same symbol, different arity -- only reachable via a flattened
+         AC representation reaching plain unify() (search itself uses
+         unify_ac for AC symbols).  Without this check the stack-frame
+         push below sizes on ARITY(s1) alone and the pop loop indexes
+         ARG(t2, c) past t2's actual arg array. */
+      goto fail;
+    }
+    else if (ARITY(s1) > 0) {
+      /* Push frame for complex term pair */
+      if (top >= cap) {
+        int new_cap = cap * 2;
+        Sframe *new_stack = safe_malloc(new_cap * sizeof(Sframe));
+        memcpy(new_stack, stack, cap * sizeof(Sframe));
+        if (stack != sbo_buf)
+          safe_free(stack);
+        stack = new_stack;
+        cap = new_cap;
+      }
+      stack[top].t1 = s1; stack[top].c1 = sc1;
+      stack[top].t2 = s2; stack[top].c2 = sc2;
+      stack[top].child = 1; stack[top].arity = ARITY(s1);
+      top++;
+      s1 = ARG(s1,0);
+      s2 = ARG(s2,0);
+      continue;
+    }
+
+    /* This pair succeeded. Pop stack and advance to next child. */
+    while (top > 0) {
+      int idx = top - 1;
+      int c = stack[idx].child;
+      if (c < stack[idx].arity) {
+        stack[idx].child = c + 1;
+        s1 = ARG(stack[idx].t1, c); sc1 = stack[idx].c1;
+        s2 = ARG(stack[idx].t2, c); sc2 = stack[idx].c2;
+        goto next_pair;
+      }
+      top--;
+    }
+    if (stack != sbo_buf)
+      safe_free(stack);
+    return TRUE;
+    next_pair: continue;
+  }
+
+fail:
+  {
+    /* Restore trail to entry state. */
+    Trail tp = *trp;
+    while (tp != entry_trail) {
+      Trail t3 = tp;
+      tp->context->terms[tp->varnum] = NULL;
+      tp->context->contexts[tp->varnum] = NULL;
+      tp = tp->next;
+      free_trail(t3);
+    }
+    *trp = entry_trail;
+  }
+  if (stack != sbo_buf)
+    safe_free(stack);
+  return FALSE;
+}  /* unify */
+
+/*************
+ *
+ *    int variant(t1, c1, t2, trail_address)
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine checks if Term t1 (in Context c1) and Term t2
+(without a Context) are variants, that is, if each is an instance of the other.
+If successful, the unifying substitution is in Context c1.
+The calling sequence and the use of Contexts and Trails is the same
+as for unify().
+*/
+
+/* PUBLIC */
+BOOL variant(Term t1, Context c1,
+	    Term t2, Trail *trp)
+{
+  /* If this gets used a lot, it should be recoded so that it won't
+   * traverse the terms twice.
+   */
+  BOOL ok;
+  Trail tr = NULL;
+  Context c2 = get_context();
+
+  if (match(t2, c2, t1, &tr)) {
+    undo_subst(tr);
+    ok = match(t1, c1, t2, trp);
+  }
+  else
+    ok = 0;
+
+  free_context(c2);
+  return ok;
+}  /* variant */
+
+/*************
+ *
+ *    int occur_check(varnum, var_context, term, term_context)
+ *
+ *    Return 0 iff variable occurs in term under substitution
+ *       (including var==term).
+ *
+ *************/
+
+/* DOCUMENTATION
+This function checks if a variable with index vn (in Context vc)
+occurs in Term t (in Context c), including the top case, where t
+is the variable in question.
+*/
+
+/* PUBLIC */
+BOOL occur_check(int vn, Context vc, Term t, Context c)
+{
+  /* Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  typedef struct { Term t; Context c; int child; } Sframe;
+  Sframe sbo_buf[64];
+  Sframe *stack = sbo_buf;
+  int cap = 64;
+  int top = 0;
+  Term s = t;
+  Context sc = c;
+
+  for (;;) {
+    if (!sc) {
+      /* NULL context: no bindings, skip */
+    }
+    else if (VARIABLE(s)) {
+      int tvn = VARNUM(s);
+      if (tvn == vn && sc == vc) {
+        if (stack != sbo_buf)
+          safe_free(stack);
+        return FALSE;
+      }
+      else if (sc->terms[tvn] != NULL) {
+        /* Follow the binding (tail call in original) */
+        Term nt = sc->terms[tvn];
+        sc = sc->contexts[tvn];
+        s = nt;
+        continue;
+      }
+      /* else uninstantiated variable, ok */
+    }
+    else if (ARITY(s) > 0) {
+      if (top >= cap) {
+        int new_cap = cap * 2;
+        Sframe *new_stack = safe_malloc(new_cap * sizeof(Sframe));
+        memcpy(new_stack, stack, cap * sizeof(Sframe));
+        if (stack != sbo_buf)
+          safe_free(stack);
+        stack = new_stack;
+        cap = new_cap;
+      }
+      stack[top].t = s; stack[top].c = sc; stack[top].child = 1; top++;
+      s = ARG(s,0);
+      continue;
+    }
+
+    /* Pop and advance */
+    while (top > 0) {
+      int idx = top - 1;
+      int ch = stack[idx].child;
+      if (ch < ARITY(stack[idx].t)) {
+        stack[idx].child = ch + 1;
+        s = ARG(stack[idx].t, ch);
+        sc = stack[idx].c;
+        goto next;
+      }
+      top--;
+    }
+    if (stack != sbo_buf)
+      safe_free(stack);
+    return TRUE;
+    next: continue;
+  }
+}  /* occur_check */
+
+/*************
+ *
+ *    int match(t1, c1, t2, trail_address) -- one-way unification.
+ *
+ *        Match returns 1 if t2 is an instance of {t1 in context c1}.
+ *    This is not a very general version, but it is useful for
+ *    demodulation and subsumption.  It assumes that the variables
+ *    of t1 and t2 are separate, that none of the variables in t2
+ *    have been instantiated, and that none of those t2's variables
+ *    will be instantiatied.  Hence, there is no context for t2,
+ *    no need to dereference more than one level, and no need for
+ *    an occur_check.
+ *
+ *        The use of the trail is the same as in `unify'.
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine checks if Term t2 (without a Context) is an
+instance of Term t1 (in Context c1).
+If successful, Context c1 and Trail * trp are updated.
+The calling sequence and the use of Contexts and Trails is similar
+to those for unify().
+*/
+
+/*************
+ *
+ *   match_anyconst() -- helper for _AnyConst matching in hints
+ *
+ *************/
+
+static BOOL match_anyconst(Term t1, Term t2, int *anyctx, Ilist *anytrp)
+{
+  int anyconst1 = any_const(SYMNUM(t1));
+  int anyconst2 = any_const(SYMNUM(t2));
+  int anyconst, i;
+  Term t;
+
+  /* CASE 1: neither is _AnyConst* */
+  if (anyconst1 == -1 && anyconst2 == -1)
+    return SYMNUM(t1) == SYMNUM(t2);
+
+  /* CASE 2: both are _AnyConst* */
+  if (anyconst1 != -1 && anyconst2 != -1) {
+    if (anyconst1 == 0 || anyconst2 == 0)
+      return TRUE;
+    return anyconst1 == anyconst2;
+  }
+
+  /* CASE 3: exactly one is _AnyConst* */
+  if (anyconst1 == -1) { anyconst = anyconst2; t = t1; }
+  else                  { anyconst = anyconst1; t = t2; }
+
+  if (anyconst == 0)
+    return TRUE;  /* generic _AnyConst matches any constant */
+
+  if (anyctx[anyconst] == -1) {
+    /* Not bound yet -- check no other _AnyConst_m is bound to this constant */
+    for (i = 1; i < MAX_ANYCONSTS; i++) {
+      if (anyctx[i] == SYMNUM(t))
+        return FALSE;
+    }
+    anyctx[anyconst] = SYMNUM(t);
+    *anytrp = ilist_prepend(*anytrp, anyconst);
+    return TRUE;
+  }
+  return anyctx[anyconst] == SYMNUM(t);
+}  /* match_anyconst */
+
+/*************
+ *
+ *   match_hints() -- match with external _AnyConst context
+ *
+ *   Like match(), but takes external anyctx/anytrp for _AnyConst
+ *   bindings that persist across multiple calls (e.g., in subsume_literals).
+ *   When anyctx is NULL, behaves exactly like standard match().
+ *
+ *************/
+
+/* PUBLIC */
+BOOL match_hints(Term t1, Context c1, Term t2, Trail *trp,
+                 int *anyctx, Ilist *anytrp)
+{
+  /* Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  typedef struct { Term t1; Term t2; int child; int arity; } Sframe;
+  Sframe sbo_buf[64];
+  Sframe *stack = sbo_buf;
+  int cap = 64;
+  int top = 0;
+  Trail entry_trail = *trp;
+  Ilist entry_anytrp = (anytrp != NULL) ? *anytrp : NULL;
+  Term s1 = t1, s2 = t2;
+  BOOL use_anyconst = (anyctx != NULL);
+
+  for (;;) {
+    if (VARIABLE(s1)) {
+      int vn = VARNUM(s1);
+      if (c1->terms[vn] == NULL) {
+        BIND_TR(vn, c1, s2, NULL, trp)
+      }
+      else if (!term_ident(c1->terms[vn], s2))
+        goto fail;
+    }
+    else if (VARIABLE(s2)) {
+      goto fail;
+    }
+    else if (ARITY(s1) == 0 && ARITY(s2) == 0) {
+      /* Both constants -- handle _AnyConst matching */
+      if (use_anyconst) {
+        if (!match_anyconst(s1, s2, anyctx, anytrp))
+          goto fail;
+      }
+      else {
+        if (SYMNUM(s1) != SYMNUM(s2))
+          goto fail;
+      }
+    }
+    else if (SYMNUM(s1) != SYMNUM(s2)) {
+      goto fail;
+    }
+    else if (ARITY(s1) > 0) {
+      if (top >= cap) {
+        int new_cap = cap * 2;
+        Sframe *new_stack = safe_malloc(new_cap * sizeof(Sframe));
+        memcpy(new_stack, stack, cap * sizeof(Sframe));
+        if (stack != sbo_buf)
+          safe_free(stack);
+        stack = new_stack;
+        cap = new_cap;
+      }
+      stack[top].t1 = s1; stack[top].t2 = s2;
+      stack[top].child = 1; stack[top].arity = ARITY(s1);
+      top++;
+      s1 = ARG(s1,0); s2 = ARG(s2,0);
+      continue;
+    }
+
+    /* This pair succeeded. Pop stack and advance. */
+    while (top > 0) {
+      int idx = top - 1;
+      int c = stack[idx].child;
+      if (c < stack[idx].arity) {
+        stack[idx].child = c + 1;
+        s1 = ARG(stack[idx].t1, c);
+        s2 = ARG(stack[idx].t2, c);
+        goto next_pair;
+      }
+      top--;
+    }
+    if (stack != sbo_buf)
+      safe_free(stack);
+    return TRUE;
+    next_pair: continue;
+  }
+
+fail:
+  {
+    Trail tp = *trp;
+    while (tp != entry_trail) {
+      Trail t3 = tp;
+      tp->context->terms[tp->varnum] = NULL;
+      tp = tp->next;
+      free_trail(t3);
+    }
+    *trp = entry_trail;
+  }
+  /* Restore anyctx bindings made by this call */
+  if (use_anyconst) {
+    while (*anytrp != entry_anytrp) {
+      anyctx[(*anytrp)->i] = -1;
+      *anytrp = ilist_pop(*anytrp);
+    }
+  }
+  if (stack != sbo_buf)
+    safe_free(stack);
+  return FALSE;
+}  /* match_hints */
+
+/*************
+ *
+ *   match() -- one-way pattern matching (wrapper)
+ *
+ *************/
+
+/* PUBLIC */
+BOOL match(Term t1, Context c1, Term t2, Trail *trp)
+{
+  if (MATCH_HINTS_ANYCONST && AnyConstsEnabled) {
+    int anyctx[MAX_ANYCONSTS];
+    Ilist anytrp = NULL;
+    BOOL ret;
+    int i;
+    for (i = 0; i < MAX_ANYCONSTS; i++)
+      anyctx[i] = -1;
+    ret = match_hints(t1, c1, t2, trp, anyctx, &anytrp);
+    zap_ilist(anytrp);
+    return ret;
+  }
+  return match_hints(t1, c1, t2, trp, NULL, NULL);
+}  /* match */
+
+/*************
+ *
+ *    Term apply(term, context) -- Apply a substitution to a term.
+ *
+ *    Apply always succeeds and returns a pointer to the
+ *    instantiated term.
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine applies the substitution in Context c to Term t.
+See the explanation of unify() for an example of the use of apply().
+*/
+
+/* PUBLIC */
+Term apply(Term t, Context c)
+{
+  /* Iterative apply using explicit stack (Pattern C). */
+  /* Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  typedef struct { Term src; Context ctx; Term dst; int child; } Sframe;
+  Sframe sbo_buf[64];
+  Sframe *stack = sbo_buf;
+  int cap = 64;
+  int top = 0;
+  Term root;
+
+  DEREFERENCE(t, c)
+
+  if (VARIABLE(t)) {
+    if (!c)
+      return get_variable_term(VARNUM(t));
+    else
+      return get_variable_term(c->multiplier * MAX_VARS + VARNUM(t));
+  }
+
+  root = get_rigid_term_like(t);
+  stack[top].src = t; stack[top].ctx = c; stack[top].dst = root;
+  stack[top].child = 0; top++;
+
+  while (top > 0) {
+    int idx = top - 1;
+    Term src = stack[idx].src;
+    Context ctx = stack[idx].ctx;
+    Term dst = stack[idx].dst;
+    int ch = stack[idx].child;
+
+    if (ch >= ARITY(src)) {
+      top--;
+    }
+    else {
+      Term child = ARG(src, ch);
+      Context cc = ctx;
+      stack[idx].child = ch + 1;
+      DEREFERENCE(child, cc)
+
+      if (VARIABLE(child)) {
+        if (!cc)
+          ARG(dst, ch) = get_variable_term(VARNUM(child));
+        else
+          ARG(dst, ch) = get_variable_term(cc->multiplier * MAX_VARS + VARNUM(child));
+      }
+      else {
+        Term child_dst = get_rigid_term_like(child);
+        ARG(dst, ch) = child_dst;
+        if (ARITY(child) > 0) {
+          if (top >= cap) {
+            int new_cap = cap * 2;
+            Sframe *new_stack = safe_malloc(new_cap * sizeof(Sframe));
+            memcpy(new_stack, stack, cap * sizeof(Sframe));
+            if (stack != sbo_buf)
+              safe_free(stack);
+            stack = new_stack;
+            cap = new_cap;
+          }
+          stack[top].src = child; stack[top].ctx = cc;
+          stack[top].dst = child_dst; stack[top].child = 0;
+          top++;
+        }
+      }
+    }
+  }
+  if (stack != sbo_buf)
+    safe_free(stack);
+  return root;
+}  /* apply */
+
+/*************
+ *
+ *    apply_substitute()
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine is like apply(), but when it reaches a particular subterm
+(into_term) of the source term (t), it continues with another source
+term (beta).
+This routine is intended to be used for paramodulation, to avoid
+unnecessary work.  For example, when paramodulating alpha=beta into
+p[into_term], where alpha unifies with into_term, we construct
+the appropriate instance of p[beta] in one step by using this routine.
+*/
+
+/* PUBLIC */
+Term apply_substitute(Term t, Term beta, Context c_from,
+		      Term into_term, Context c_into)
+{
+  /* Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  typedef struct { Term src; Term dst; int child; } Sframe;
+  Sframe sbo_buf[64];
+  Sframe *stack = sbo_buf;
+  int cap = 64;
+  int top = 0;
+  Term root;
+
+  if (t == into_term)
+    return apply(beta, c_from);
+  if (VARIABLE(t))
+    return apply(t, c_into);
+
+  root = get_rigid_term_like(t);
+  stack[top].src = t; stack[top].dst = root; stack[top].child = 0; top++;
+
+  while (top > 0) {
+    int idx = top - 1;
+    Term src = stack[idx].src;
+    Term dst = stack[idx].dst;
+    int ch = stack[idx].child;
+
+    if (ch >= ARITY(src)) {
+      top--;
+    }
+    else {
+      Term child = ARG(src, ch);
+      stack[idx].child = ch + 1;
+      if (child == into_term) {
+        ARG(dst, ch) = apply(beta, c_from);
+      }
+      else if (VARIABLE(child)) {
+        ARG(dst, ch) = apply(child, c_into);
+      }
+      else {
+        Term child_dst = get_rigid_term_like(child);
+        ARG(dst, ch) = child_dst;
+        if (ARITY(child) > 0) {
+          if (top >= cap) {
+            int new_cap = cap * 2;
+            Sframe *new_stack = safe_malloc(new_cap * sizeof(Sframe));
+            memcpy(new_stack, stack, cap * sizeof(Sframe));
+            if (stack != sbo_buf)
+              safe_free(stack);
+            stack = new_stack;
+            cap = new_cap;
+          }
+          stack[top].src = child; stack[top].dst = child_dst;
+          stack[top].child = 0; top++;
+        }
+      }
+    }
+  }
+  if (stack != sbo_buf)
+    safe_free(stack);
+  return root;
+}  /* apply_substitute */
+
+/*************
+ *
+ *    apply_substitute2()
+ *
+ *************/
+
+/* DOCUMENTATION
+Similar to apply_substitute, but the into_term is specified with
+a position vector instead of the term itself.  This is so that
+the into term can be a variable.  (Recall that variables are
+probably shared, and we have to specify an *occurrence*.)
+*/
+
+/* PUBLIC */
+Term apply_substitute2(Term t, Term beta, Context c_from,
+		       Ilist into_pos, Context c_into)
+{
+  /* Follow the position path iteratively, building terms along the way.
+     Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  typedef struct { Term src; Term dst; int arg_pos; } Pframe;
+  Pframe sbo_buf[64];
+  Pframe *path = sbo_buf;
+  int cap = 64;
+  int depth = 0;
+  Term src = t;
+  Ilist pos = into_pos;
+  Term result;
+  int j;
+
+  if (into_pos == NULL)
+    return apply(beta, c_from);
+  if (VARIABLE(t))
+    return apply(t, c_into);
+
+  /* Build the spine along the position path */
+  while (pos != NULL && !VARIABLE(src)) {
+    Term dst = get_rigid_term_like(src);
+    int arg_pos = pos->i - 1;
+    int i;
+    if (depth >= cap) {
+      int new_cap = cap * 2;
+      Pframe *new_path = safe_malloc(new_cap * sizeof(Pframe));
+      memcpy(new_path, path, cap * sizeof(Pframe));
+      if (path != sbo_buf)
+        safe_free(path);
+      path = new_path;
+      cap = new_cap;
+    }
+    path[depth].src = src; path[depth].dst = dst;
+    path[depth].arg_pos = arg_pos;
+    depth++;
+    /* Apply all non-path children */
+    for (i = 0; i < ARITY(src); i++) {
+      if (i != arg_pos)
+        ARG(dst, i) = apply(ARG(src, i), c_into);
+    }
+    src = ARG(src, arg_pos);
+    pos = pos->next;
+  }
+
+  /* At the end of the path */
+  if (pos == NULL)
+    result = apply(beta, c_from);
+  else
+    result = apply(src, c_into);
+
+  /* Link back up the spine */
+  for (j = depth - 1; j >= 0; j--) {
+    ARG(path[j].dst, path[j].arg_pos) = result;
+    result = path[j].dst;
+  }
+
+  if (path != sbo_buf)
+    safe_free(path);
+  return result;
+}  /* apply_substitute2 */
+
+/*************
+ *
+ *    apply_demod()
+ *
+ *    Special-purpose apply for ordinary demodulation.
+ *    Assume every variable in t is instantated by the
+ *    substitution.  Terms that come from instantiating
+ *    variables get the flag set, indicating that the
+ *    term is fully demodulated (assuming inside-out
+ *    demodulation).
+ *    
+ *************/
+
+/* DOCUMENTATION
+*/
+
+/* PUBLIC */
+Term apply_demod(Term t, Context c, int flag)
+{
+  /* Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  typedef struct { Term src; Term dst; int child; } Sframe;
+  Sframe sbo_buf[64];
+  Sframe *stack = sbo_buf;
+  int cap = 64;
+  int top = 0;
+  Term root;
+
+  /* A NULL context means copy the term verbatim (variables stay
+     variables).  contract_bt uses this for the unmatched remainder
+     of an AC term (EQP's apply_demod had the same convention). */
+  if (VARIABLE(t)) {
+    Term b = copy_term(c == NULL ? t : c->terms[VARNUM(t)]);
+    term_flag_set(b, flag);
+    return b;
+  }
+
+  root = get_rigid_term_like(t);
+  stack[top].src = t; stack[top].dst = root; stack[top].child = 0; top++;
+
+  while (top > 0) {
+    int idx = top - 1;
+    Term src = stack[idx].src;
+    Term dst = stack[idx].dst;
+    int ch = stack[idx].child;
+
+    if (ch >= ARITY(src)) {
+      top--;
+    }
+    else {
+      Term child = ARG(src, ch);
+      stack[idx].child = ch + 1;
+      if (VARIABLE(child)) {
+        Term b = copy_term(c == NULL ? child : c->terms[VARNUM(child)]);
+        term_flag_set(b, flag);
+        ARG(dst, ch) = b;
+      }
+      else {
+        Term child_dst = get_rigid_term_like(child);
+        ARG(dst, ch) = child_dst;
+        if (ARITY(child) > 0) {
+          if (top >= cap) {
+            int new_cap = cap * 2;
+            Sframe *new_stack = safe_malloc(new_cap * sizeof(Sframe));
+            memcpy(new_stack, stack, cap * sizeof(Sframe));
+            if (stack != sbo_buf)
+              safe_free(stack);
+            stack = new_stack;
+            cap = new_cap;
+          }
+          stack[top].src = child; stack[top].dst = child_dst;
+          stack[top].child = 0; top++;
+        }
+      }
+    }
+  }
+  if (stack != sbo_buf)
+    safe_free(stack);
+  return root;
+}  /* apply_demod */
+
+/*************
+ *
+ *    undo_subst(tr) -- Clear a substitution.
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine clears substitution entries recoded in Trail tr,
+and frees the corresponding Trail nodes.
+*/
+
+/* PUBLIC */
+void undo_subst(Trail tr)
+{
+  Trail t3;
+  while (tr != NULL) {
+    tr->context->terms[tr->varnum] = NULL;
+    tr->context->contexts[tr->varnum] = NULL;
+    t3 = tr;
+    tr = tr->next;
+    free_trail(t3);
+  }
+}  /* undo_subst */
+
+/*************
+ *
+ *    undo_subst_2(trail_1, trail_2) -- Clear part of a substitution.
+ *
+ *    It is assumed that trail_2 (possibly NULL) is a subtrail
+ *    of trail_1. This routine clears entries starting at trail_1,
+ *    up to (but not including) trail_2.
+ *
+ *************/
+
+/* DOCUMENTATION
+It is assumed that Trail sub_tr is a subtrail of Trail tr.
+This routine clears part (maybe all) of a substitution, by
+clearing the entries from tr up to, but not including sub_tr.
+The corresponding Trail nodes are deallocated, so the
+caller should no longer refer to tr.  (This is useful for
+inference rules like hyperresolution, which backtrack,
+undoing parts of substitutions.)
+*/
+
+/* PUBLIC */
+void undo_subst_2(Trail tr, Trail sub_tr)
+{
+  Trail t3;
+  while (tr != sub_tr) {
+    tr->context->terms[tr->varnum] = NULL;
+    tr->context->contexts[tr->varnum] = NULL;
+    t3 = tr;
+    tr = tr->next;
+    free_trail(t3);
+  }
+}  /* undo_subst_2 */
+
+/*************
+ *
+ *    fprint_context(file_ptr, context)
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine prints (to FILE *fp) a Context.
+*/
+
+/* PUBLIC */
+void fprint_context(FILE *fp, Context c)
+{
+  int i;
+  
+  if (c == NULL)
+    fprintf(fp, "Substitution NULL.\n");
+  else {
+    fprintf(fp, "Substitution, multiplier %d\n", c->multiplier);
+    for (i=0; i< MAX_VARS; i++) {
+      if (c->terms[i] != NULL) {
+	Term t = get_variable_term(i);
+	fprint_term(fp, t);
+	free_term(t);
+	fprintf(fp, " [%p] -> ", c);
+	fprint_term(fp, c->terms[i]);
+	if (c->contexts[i] == NULL)
+	  fprintf(fp, " (NULL context)\n");
+	else
+	  fprintf(fp, " [%p:%d]\n", c->contexts[i],
+		  c->contexts[i]->multiplier);
+      }
+    }
+#if 0    
+    if (c->partial_term) {
+      printf("partial_term: ");
+      print_term(fp, c->partial_term);
+      printf("\n");
+    }
+#endif
+  }
+}  /* fprint_context */
+
+/*************
+ *
+ *    p_context(context)
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine prints (to stdout) a Context.
+*/
+
+/* PUBLIC */
+void p_context(Context c)
+{
+  fprint_context(stdout, c);
+}  /* p_context */
+
+/*************
+ *
+ *    fprint_trail(file_ptr, context)
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine prints (to FILE *fp) a Trail.  The whole list is printed.
+*/
+
+/* PUBLIC */
+void fprint_trail(FILE *fp, Trail t)
+{
+  Trail t2;
+  fprintf(fp, "Trail:");
+  t2 = t;
+  while (t2 != NULL) {
+    fprintf(fp, " <%d,%p>", t2->varnum, t2->context);
+    t2 = t2->next;
+  }
+  fprintf(fp, ".\n");
+}  /* fprint_trail */
+
+/*************
+ *
+ *    p_trail(context)
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine prints (to stdout) a Trail.  The whole list is printed.
+*/
+
+/* PUBLIC */
+void p_trail(Trail t)
+{
+  fprint_trail(stdout, t);
+}  /* p_trail */
+
+/*************
+ *
+ *   AnyVariable matching for weight rules (Veroff/Justermans, 2016)
+ *
+ *************/
+
+static BOOL AnyVarsInited = FALSE;
+static int AnyVars[MAX_ANYVARS];
+
+static int any_var(int sn)
+{
+  int i;
+  if (!AnyVarsInited) {
+    char str[16];
+    AnyVars[0] = str_to_sn("_", 0);
+    for (i = 1; i < MAX_ANYVARS; i++) {
+      snprintf(str, 16, "_%d", i);
+      AnyVars[i] = str_to_sn(str, 0);
+    }
+    AnyVarsInited = TRUE;
+  }
+  for (i = 0; i < MAX_ANYVARS; i++) {
+    if (AnyVars[i] == sn)
+      return i;
+  }
+  return -1;
+}  /* any_var */
+
+/*************
+ *
+ *   is_any_var_sym()
+ *
+ *************/
+
+/* DOCUMENTATION
+Return TRUE if sn is the symbol number of an any-variable symbol
+("_" or "_1" .. "_9").  Exposed so that other matching modes
+(e.g., the Wos resonator matcher) can detect these positions.
+*/
+
+/* PUBLIC */
+BOOL is_any_var_sym(int sn)
+{
+  return any_var(sn) != -1;
+}  /* is_any_var_sym */
+
+static BOOL match_anyvar(int anyvar, Term t2, int *anyvar_ctx)
+{
+  int i;
+  if (!VARIABLE(t2))
+    return FALSE;
+  if (anyvar == 0)
+    return TRUE;  /* "_" matches any variable */
+  if (anyvar_ctx[anyvar] == -1) {
+    for (i = 1; i < MAX_ANYVARS; i++) {
+      if (anyvar_ctx[i] == VARNUM(t2))
+        return FALSE;  /* another _m already bound to this var */
+    }
+    anyvar_ctx[anyvar] = VARNUM(t2);
+    return TRUE;
+  }
+  return anyvar_ctx[anyvar] == VARNUM(t2);
+}  /* match_anyvar */
+
+/*************
+ *
+ *   match_weight()
+ *
+ *************/
+
+/* DOCUMENTATION
+Special-purpose match for weighting.
+The anyvar_ctx array (size MAX_ANYVARS) tracks _/_1.._9 bindings.
+*/
+
+/* PUBLIC */
+BOOL match_weight(Term t1, Context c1, Term t2, Trail *trp, int *anyvar_ctx)
+{
+  /* Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  typedef struct { Term t1; Term t2; int child; int arity; } Sframe;
+  Sframe sbo_buf[64];
+  Sframe *stack = sbo_buf;
+  int cap = 64;
+  int top = 0;
+  Trail entry_trail = *trp;
+  Term s1 = t1, s2 = t2;
+
+  for (;;) {
+    {
+      int anyvar = any_var(SYMNUM(s1));
+      if (anyvar != -1) {
+        if (!match_anyvar(anyvar, s2, anyvar_ctx))
+          goto fail;
+      }
+      else if (SYMNUM(s1) == str_to_sn("@", 0)) {
+        if (!CONSTANT(s2))
+          goto fail;
+      }
+      else if (VARIABLE(s1)) {
+        int vn = VARNUM(s1);
+        if (c1->terms[vn] == NULL) {
+          BIND_TR(vn, c1, s2, NULL, trp)
+        }
+        else if (!term_ident(c1->terms[vn], s2))
+          goto fail;
+      }
+      else if (VARIABLE(s2)) {
+        goto fail;
+      }
+      else if (SYMNUM(s1) != SYMNUM(s2)) {
+        goto fail;
+      }
+      else if (ARITY(s1) > 0) {
+        if (top >= cap) {
+          int new_cap = cap * 2;
+          Sframe *new_stack = safe_malloc(new_cap * sizeof(Sframe));
+          memcpy(new_stack, stack, cap * sizeof(Sframe));
+          if (stack != sbo_buf)
+            safe_free(stack);
+          stack = new_stack;
+          cap = new_cap;
+        }
+        stack[top].t1 = s1; stack[top].t2 = s2;
+        stack[top].child = 1; stack[top].arity = ARITY(s1);
+        top++;
+        s1 = ARG(s1,0); s2 = ARG(s2,0);
+        continue;
+      }
+    }
+
+    while (top > 0) {
+      int idx = top - 1;
+      int c = stack[idx].child;
+      if (c < stack[idx].arity) {
+        stack[idx].child = c + 1;
+        s1 = ARG(stack[idx].t1, c);
+        s2 = ARG(stack[idx].t2, c);
+        goto next_pair;
+      }
+      top--;
+    }
+    if (stack != sbo_buf)
+      safe_free(stack);
+    return TRUE;
+    next_pair: continue;
+  }
+
+fail:
+  {
+    Trail tp = *trp;
+    while (tp != entry_trail) {
+      Trail t3 = tp;
+      tp->context->terms[tp->varnum] = NULL;
+      tp = tp->next;
+      free_trail(t3);
+    }
+    *trp = entry_trail;
+  }
+  if (stack != sbo_buf)
+    safe_free(stack);
+  return FALSE;
+}  /* match_weight */
+
+/*************
+ *
+ *   match_resonator()
+ *
+ *************/
+
+/* DOCUMENTATION
+Wos-style resonator matching for weight templates.
+<P>
+A resonator is a formula schema in which every variable position
+is an independent wildcard: it matches ANY subterm (variable OR
+complex) with NO binding consistency across occurrences.  This
+generalizes Otter's wt_match semantics (which matched only
+variables, suitable for sentential calculus) to the full-term
+regime needed for resonators in algebraic settings like group
+theory or Robbins algebra.
+<P>
+Specifically, within the pattern <I>pattern</I>:
+<UL>
+<LI> Any true variable position matches anything in <I>target</I>.
+<LI> Any any-variable symbol ("_" or "_1" .. "_9") also matches
+     anything -- the normal binding rules of match_weight are
+     <B>not</B> imposed here.
+<LI> Constant and compound positions must match structurally
+     (same symbol, same arity, recursively matching arguments).
+</UL>
+<P>
+No Context/Trail is needed because nothing is bound.  This is the
+matching semantics that makes Wos's resonance strategy expressible.
+*/
+
+/* PUBLIC */
+BOOL match_resonator(Term pattern, Term target)
+{
+  /* Otter-compatible type matching: a variable in the pattern only
+     matches a variable in the target (not a complex term or constant).
+     This matches Otter's wt_match semantics for weight_list templates,
+     where weight(t(i(A,A)),2) only matches clauses with variables at
+     the A positions, not arbitrary subterms. */
+  if (VARIABLE(pattern))
+    return VARIABLE(target);
+  if (any_var(SYMNUM(pattern)) != -1)
+    return TRUE;
+  /* Pattern is a constant or compound; target must share its shape. */
+  if (VARIABLE(target))
+    return FALSE;
+  if (SYMNUM(pattern) != SYMNUM(target))
+    return FALSE;
+  {
+    int i;
+    int n = ARITY(pattern);
+    if (n != ARITY(target))
+      return FALSE;
+    for (i = 0; i < n; i++) {
+      if (!match_resonator(ARG(pattern, i), ARG(target, i)))
+        return FALSE;
+    }
+  }
+  return TRUE;
+}  /* match_resonator */
+
+/*************
+ *
+ *   vars_in_trail()
+ *
+ *************/
+
+/* DOCUMENTATION
+Return the list of variables (as integers) in a trail.  Note that this
+ignores the contexts associated with the varibles.
+*/
+
+/* PUBLIC */
+Ilist vars_in_trail(Trail tr)
+{
+  Ilist result = NULL;
+  while (tr != NULL) {
+    result = ilist_prepend(result, tr->varnum);
+    tr = tr->next;
+  }
+  return result;
+}  /* vars_in_trail */
+
+/*************
+ *
+ *   context_to_pairs()
+ *
+ *************/
+
+/* DOCUMENTATION
+*/
+
+/* PUBLIC */
+Plist context_to_pairs(Ilist varnums, Context c)
+{
+  Plist pairs = NULL;
+  int i;
+  for (i = 0; i < MAX_VARS; i++) {
+    if (ilist_member(varnums, i)) {
+      Term var = get_variable_term(i);
+      Term t = apply(var, c);
+      if (!term_ident(var, t)) {
+	Term pair = listterm_cons(var, t);
+	pairs = plist_append(pairs, pair);
+      }
+      else {
+	zap_term(var);
+	zap_term(t);
+      }
+    }
+  }
+  return pairs;
+}  /* context_to_pairs */
+
+/*************
+ *
+ *   empty_substitution()
+ *
+ *************/
+
+/* DOCUMENTATION
+*/
+
+/* PUBLIC */
+BOOL empty_substitution(Context s)
+{
+  int i;
+  for (i = 0; i < MAX_VARS; i++) {
+    if (s->terms[i] != NULL)
+      return FALSE;
+  }
+  return TRUE;
+}  /* empty_substitution */
+
+/*************
+ *
+ *   variable_substitution()
+ *
+ *************/
+
+/* DOCUMENTATION
+*/
+
+/* PUBLIC */
+BOOL variable_substitution(Context s)
+{
+  int i;
+  for (i = 0; i < MAX_VARS; i++) {
+    if (s->terms[i]) {
+      Term t = s->terms[i];
+      Context c = s->contexts[i];
+      DEREFERENCE(t,c);
+      if (!VARIABLE(t))
+	return FALSE;
+    }
+  }
+  return TRUE;
+}  /* variable_substitution */
+
+/*************
+ *
+ *    subst_changes_term(term, context)
+ *
+ *************/
+
+/* DOCUMENTATION
+This routine checks if a subsitution would change a term, if applied.
+*/
+
+/* PUBLIC */
+BOOL subst_changes_term(Term t, Context c)
+{
+  /* Small-buffer optimization: a small on-stack buffer handles the
+     common shallow case at zero allocation cost; only pathologically
+     deep terms spill to a growable heap array (safe_malloc/free
+     doubling). A fixed array here silently corrupts memory on very
+     deep terms; an unconditional heap allocation on every call is
+     measurably slower at this function's call volume (confirmed
+     ~40% wall-clock regression on Scharle24_2D3_D3_to_Nicod_16h,
+     136M+ clause generations). */
+  Term sbo_buf[64];
+  Term *stack = sbo_buf;
+  int cap = 64;
+  int top = 0;
+  stack[top++] = t;
+  while (top > 0) {
+    Term s = stack[--top];
+    if (VARIABLE(s)) {
+      if (c->terms[VARNUM(s)] != NULL) {
+        if (stack != sbo_buf)
+          safe_free(stack);
+        return TRUE;
+      }
+    }
+    else {
+      int i;
+      for (i = ARITY(s) - 1; i >= 0; i--) {
+        if (top >= cap) {
+          int new_cap = cap * 2;
+          Term *new_stack = safe_malloc(new_cap * sizeof(Term));
+          memcpy(new_stack, stack, cap * sizeof(Term));
+          if (stack != sbo_buf)
+            safe_free(stack);
+          stack = new_stack;
+          cap = new_cap;
+        }
+        stack[top++] = ARG(s,i);
+      }
+    }
+  }
+  if (stack != sbo_buf)
+    safe_free(stack);
+  return FALSE;
+}  /* subst_changes_term */
+

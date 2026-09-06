@@ -1,0 +1,112 @@
+# Cross-project note drop zone (see inbox/README.md) -- local only, never
+# committed, mirrors the same convention used in other collaborating
+# projects' repos.
+/inbox/
+
+# Build artifacts -- object files, static libraries, compiled binaries
+*.o
+*.d
+*.a
+bin/*
+!bin/.gitkeep
+provers.src/prover9
+provers.src/autosketches4
+provers.src/fof-prover9
+provers.src/ladr_to_tptp
+provers.src/newauto
+provers.src/newsax
+provers.src/tptp_to_ladr
+mace4.src/mace4
+apps.src/latfilter
+apps.src/olfilter
+apps.src/clausefilter
+apps.src/idfilter
+apps.src/renamer
+apps.src/unfast
+apps.src/clausetester
+apps.src/rewriter
+apps.src/isofilter0
+apps.src/isofilter
+apps.src/isofilter2
+apps.src/dprofiles
+apps.src/interpfilter
+apps.src/upper-covers
+apps.src/miniscope
+apps.src/interpformat
+apps.src/prooftrans
+apps.src/mirror-flip
+apps.src/perm3
+apps.src/sigtest
+apps.src/directproof
+apps.src/test_clause_eval
+apps.src/test_complex
+apps.src/complex
+apps.src/gen_trc_defs
+test.src/avltest
+test.src/tptp_test
+
+# Hidden files and directories (dotfiles)
+.*
+!.gitignore
+!.gitkeep
+
+# PGO profile data
+pgo_data/
+
+# Debug symbol bundles (macOS)
+*.dSYM/
+
+# Editor/IDE
+*~
+*.swp
+TAGS
+
+# Checkpoint directories (prover9 checkpoint/resume)
+prover9_*_ckpt_*/
+
+# Output directory
+output/
+
+# Development debris (from original 2009 distribution)
+bob/
+save/
+old/
+backup.*/
+temp
+temp[0-9]*
+*.bak
+*.save
+*.work
+*.tar.gz
+
+# Local test and benchmark scripts
+test_*.sh
+
+# Web apps (deployed separately, not published to GitHub)
+web-combo/
+web-prover9/
+web-mace4/
+
+# Private verification scripts (not for public release)
+verification/agmv_submit.py
+verification/agmv_local.py
+verification/gdv_local.py
+
+# Internal docs (not for public release) -- session/investigation
+# narratives never meant for public consumption; kept locally only.
+# Whole directory ignored by default (not just a per-file list) so a new
+# spec/investigation doc is never committed by accident -- opt a specific,
+# reviewed file in with `git add -f` if it's genuinely meant to ship.
+README.fitelson-otter
+/docs/
+/doc/
+
+# AC-unification scratch/investigation test area -- ad hoc .in/.out/.tstp
+# snapshots from debugging sessions accumulate here (e.g. filenames with
+# personal names baked in, like *.jeff.tstp) and were never meant to be
+# public. Wholesale-ignored like docs/ above; does not retroactively
+# untrack the files already committed here (real algebra test-suite
+# content) -- only stops new ones from being tracked by accident. A
+# specific new file meant to actually join the test suite still needs
+# an explicit, deliberate `git add -f`.
+/tests.ac/

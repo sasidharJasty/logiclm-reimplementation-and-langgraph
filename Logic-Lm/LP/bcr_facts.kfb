@@ -1,0 +1,7 @@
+# Facts about a small family
+
+son_of(bob, alice, carol)
+daughter_of(diana, alice, carol)
+son_of(eric, bob, diana)
+daughter_of(fiona, bob, diana)
+daughter_of(gina, eric, fiona)

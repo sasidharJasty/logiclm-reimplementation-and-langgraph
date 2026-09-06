@@ -1,0 +1,76 @@
+/*  Copyright (C) 2006, 2007 William McCune
+
+    This file is part of the LADR Deduction Library.
+
+    The LADR Deduction Library is free software; you can redistribute it
+    and/or modify it under the terms of the GNU General Public License,
+    version 2.
+
+    The LADR Deduction Library is distributed in the hope that it will be
+    useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with the LADR Deduction Library; if not, write to the Free Software
+    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+#ifndef TP_SUBSUME_H
+#define TP_SUBSUME_H
+
+#include "parautil.h"
+#include "lindex.h"
+#include "features.h"
+
+/* INTRODUCTION
+*/
+
+/* Public definitions */
+
+/* End of public definitions */
+
+/* Public function prototypes from subsume.c */
+
+unsigned long long nonunit_subsumption_tests(void);
+
+BOOL subsumes(Topform c, Topform d);
+
+BOOL subsumes_bt(Topform c, Topform d);
+
+BOOL anc_subsume(Topform c, Topform d, BOOL use_prf_weight);
+
+Topform forward_subsume(Topform d, Lindex idx);
+
+/* Like forward_subsume, but skips candidates rejected by accept_cb.
+   accept_cb(subsumer, new_clause, cb_arg) returns TRUE to accept this
+   subsumer (return it) or FALSE to skip it and try the next candidate.
+   Used to support set(ancestor_subsume): if the first candidate is an
+   alphabetic variant with longer proof, the caller wants to keep the
+   new clause AND check whether other non-blocked subsumers exist.
+   Matches Otter's forward_subsume behavior (clause.c). */
+Topform forward_subsume_filter(Topform d, Lindex idx,
+                               BOOL (*accept_cb)(Topform subsumer,
+                                                 Topform new_clause,
+                                                 void *arg),
+                               void *cb_arg);
+
+Plist back_subsume(Topform c, Lindex idx);
+
+Topform back_subsume_one(Topform c, Lindex idx);
+
+void unit_conflict_by_index(Topform c, Lindex idx, void (*empty_proc) (Topform));
+
+Topform try_unit_conflict(Topform a, Topform b);
+
+void unit_delete(Topform c, Lindex idx);
+
+Plist back_unit_del_by_index(Topform unit, Lindex idx);
+
+void simplify_literals(Topform c);
+
+BOOL eq_removable_literal(Topform c, Literals lit);
+
+void simplify_literals2(Topform c);
+
+#endif  /* conditional compilation of whole file */
