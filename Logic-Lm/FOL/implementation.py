@@ -552,7 +552,7 @@ def prove(input):
     if "SEARCH FAILED" in input:
         return False
 
-    raise ValueError("Prover9 output did not contain a recognized result.")
+    return None
 
 
 # Formulate fol program.

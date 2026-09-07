@@ -19,6 +19,7 @@ from LP.implementation import (
 )
 import main
 from SAT.implementation import SATProgram, solve_sat
+from FOL.implementation import prove as prove_fol
 
 
 # Test plural predicate aliases do not break inference.
@@ -143,3 +144,16 @@ def test_z3_sat_entailment_and_unsat():
     )
     assert solve_sat(entailed)["proved"] is True
     assert solve_sat(contradicted)["proved"] is False
+
+
+def test_csp_boolean_expressions_short_circuit_and_support_bitwise_ops():
+    from CSP.implementation import make_function_constraint
+
+    assert make_function_constraint("False and (1 / 0)", [])() is False
+    assert make_function_constraint("True or (1 / 0)", [])() is True
+    assert make_function_constraint("A & B", ["A", "B"])(True, True) is True
+    assert make_function_constraint("A | B", ["A", "B"])(False, True) is True
+
+
+def test_fol_unknown_result_remains_nonfatal():
+    assert prove_fol("unexpected prover output") is None

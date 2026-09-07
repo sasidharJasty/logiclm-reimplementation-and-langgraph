@@ -1125,10 +1125,19 @@ graph.add_edge(
 agent = graph.compile()
 
 def run():
-    from IPython.display import Image, display
     from langchain.messages import HumanMessage
 
-    display(Image(agent.get_graph(xray=True).draw_mermaid_png()))
+    try:
+        from IPython.display import Image, display
+    except ImportError:
+        Image = None
+        display = None
+
+    if Image is not None and display is not None:
+        try:
+            display(Image(agent.get_graph(xray=True).draw_mermaid_png()))
+        except Exception:
+            print("Graph visualization unavailable; continuing without it.")
 
     inp = ""
     while inp.lower() != "exit":
