@@ -546,11 +546,16 @@ def make_function_constraint(expression, variable_names):
             raise ValueError("Unsupported unary operator")
 
         if isinstance(node, ast.BoolOp):
-            values = [evaluate(value, environment) for value in node.values]
             if isinstance(node.op, ast.And):
-                return all(values)
+                for value in node.values:
+                    if not evaluate(value, environment):
+                        return False
+                return True
             if isinstance(node.op, ast.Or):
-                return any(values)
+                for value in node.values:
+                    if evaluate(value, environment):
+                        return True
+                return False
             raise ValueError("Unsupported Boolean operator")
 
         if isinstance(node, ast.BinOp):
@@ -572,6 +577,10 @@ def make_function_constraint(expression, variable_names):
                 if not isinstance(right, (int, float)) or right < 0 or right > 100:
                     raise ValueError("Exponent must be between 0 and 100")
                 return left ** right
+            if isinstance(node.op, ast.BitAnd):
+                return left & right
+            if isinstance(node.op, ast.BitOr):
+                return left | right
             raise ValueError("Unsupported binary operator")
 
         if isinstance(node, ast.Compare):
