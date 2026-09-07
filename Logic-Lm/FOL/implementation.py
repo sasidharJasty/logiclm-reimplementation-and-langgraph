@@ -511,6 +511,7 @@ _PROVER9_BIN = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "Prover9-LADR-2026-8A", "bin", "prover9"
 )
+PROVER9_TIMEOUT_SECONDS = 30
 
 
 # Run prover9.
@@ -522,9 +523,20 @@ def run_prover9(input):
         prover9_path = _PROVER9_BIN if os.path.exists(_PROVER9_BIN) else "prover9"
         result = subprocess.run(
             [prover9_path, "-f", temp_file],
-            capture_output=True, text=True
+            capture_output=True,
+            text=True,
+            timeout=PROVER9_TIMEOUT_SECONDS,
         )
-        return result.stdout + result.stderr
+        output = result.stdout + result.stderr
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Prover9 failed with exit code {result.returncode}: {output}"
+            )
+        return output
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Prover9 exceeded the {PROVER9_TIMEOUT_SECONDS}-second timeout."
+        ) from exc
     finally:
         os.unlink(temp_file)
 
@@ -540,7 +552,7 @@ def prove(input):
     if "SEARCH FAILED" in input:
         return False
 
-    return None
+    raise ValueError("Prover9 output did not contain a recognized result.")
 
 
 # Formulate fol program.
