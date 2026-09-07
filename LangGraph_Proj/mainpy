@@ -852,16 +852,11 @@ def _rag_context(message):
         normalize_query(message)
     )
 
-    facts = [
-        d for d in docs
-        if d.metadata["kind"]=="fact"
-    ]
-
     return {
         "rag_context":
         "\n".join(
             f"- {d.page_content}"
-            for d in facts
+            for d in docs
         )
     }
 
@@ -990,11 +985,31 @@ def find_entities(predicate_name: str):
     """
 
     answers = []
+    answers.extend(
+        fact.args[0]
+        for fact in KB.facts
+        if fact.name == predicate_name and fact.args
+    )
 
-    for fact in KB.facts:
-        if fact.name == predicate_name:
-            answers.append(fact.args[0])
+    derived_unary = any(
+        rule.consequent.name == predicate_name
+        and len(rule.consequent.args) == 1
+        for rule in KB.rules
+    )
+    if derived_unary:
+        entities = {
+            argument
+            for fact in KB.facts
+            for argument in fact.args
+            if argument and argument[0].isupper()
+        }
+        answers.extend(
+            entity
+            for entity in sorted(entities)
+            if query(KB, Predicate(predicate_name, [entity])).proved
+        )
 
+    answers = list(dict.fromkeys(answers))
     return answers
 
 
@@ -1019,6 +1034,9 @@ tool_node = ToolNode(
 def should_continue(state):
 
     last_message = state["messages"][-1]
+
+    if state.get("llm_calls", 0) >= 20:
+        return "end"
 
     if last_message.tool_calls:
         return "tools"
@@ -1106,23 +1124,21 @@ graph.add_edge(
 
 agent = graph.compile()
 
-# Show the agent
-from IPython.display import Image, display
-display(Image(agent.get_graph(xray=True).draw_mermaid_png()))
+def run():
+    from IPython.display import Image, display
+    from langchain.messages import HumanMessage
 
-# Invoke
-from langchain.messages import HumanMessage
-messages = [HumanMessage(content="does venus orbit earth?")]
-messages = agent.invoke({"messages": messages})
-for m in messages["messages"]:
-    m.pretty_print()
+    display(Image(agent.get_graph(xray=True).draw_mermaid_png()))
 
-inp = ""
-while inp.lower() != "exit":
-    inp = input("Enter a question (or 'exit' to quit): ")
-    if inp.lower() == "exit":
-        break
-    messages = [HumanMessage(content=inp)]
-    messages = agent.invoke({"messages": messages})
-    for m in messages["messages"]:
-        m.pretty_print()
+    inp = ""
+    while inp.lower() != "exit":
+        inp = input("Enter a question (or 'exit' to quit): ")
+        if inp.lower() == "exit":
+            break
+        messages = agent.invoke({"messages": [HumanMessage(content=inp)]})
+        for message in messages["messages"]:
+            message.pretty_print()
+
+
+if __name__ == "__main__":
+    run()

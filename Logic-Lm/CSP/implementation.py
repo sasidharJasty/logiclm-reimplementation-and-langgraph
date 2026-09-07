@@ -526,17 +526,80 @@ def make_function_constraint(expression, variable_names):
             + ", ".join(sorted(unknown_names))
         )
 
+    def evaluate(node, environment):
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (bool, int, float)):
+                return node.value
+            raise ValueError("Only Boolean and numeric constants are supported")
+
+        if isinstance(node, ast.Name):
+            return environment[node.id]
+
+        if isinstance(node, ast.UnaryOp):
+            value = evaluate(node.operand, environment)
+            if isinstance(node.op, ast.USub):
+                return -value
+            if isinstance(node.op, ast.UAdd):
+                return value
+            if isinstance(node.op, ast.Not):
+                return not value
+            raise ValueError("Unsupported unary operator")
+
+        if isinstance(node, ast.BoolOp):
+            values = [evaluate(value, environment) for value in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+            raise ValueError("Unsupported Boolean operator")
+
+        if isinstance(node, ast.BinOp):
+            left = evaluate(node.left, environment)
+            right = evaluate(node.right, environment)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.FloorDiv):
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.Pow):
+                if not isinstance(right, (int, float)) or right < 0 or right > 100:
+                    raise ValueError("Exponent must be between 0 and 100")
+                return left ** right
+            raise ValueError("Unsupported binary operator")
+
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != 1 or len(node.comparators) != 1:
+                raise ValueError("Only single comparisons are supported")
+            left = evaluate(node.left, environment)
+            right = evaluate(node.comparators[0], environment)
+            operator = node.ops[0]
+            if isinstance(operator, ast.Lt):
+                return left < right
+            if isinstance(operator, ast.LtE):
+                return left <= right
+            if isinstance(operator, ast.Gt):
+                return left > right
+            if isinstance(operator, ast.GtE):
+                return left >= right
+            if isinstance(operator, ast.Eq):
+                return left == right
+            if isinstance(operator, ast.NotEq):
+                return left != right
+            raise ValueError("Unsupported comparison operator")
+
+        raise ValueError(f"Unsupported expression node: {type(node).__name__}")
+
     # Constraint.
     def constraint(*values):
         environment = dict(zip(variable_names, values))
-
-        return bool(
-            eval(
-                expression,
-                {"__builtins__": {}},
-                environment
-            )
-        )
+        return bool(evaluate(parsed.body, environment))
 
     return constraint
 
@@ -689,6 +752,14 @@ def project_solution(solution, query_variables):
 
 # Solve csp.
 def solve_csp(program):
+    declared_variables = {variable.name for variable in program.variables}
+    unknown_query_variables = set(program.query.variables) - declared_variables
+    if unknown_query_variables:
+        raise ValueError(
+            "Query references variables that are not declared: "
+            + ", ".join(sorted(unknown_query_variables))
+        )
+
     problem = build_problem(program)
 
     query_variables = program.query.variables

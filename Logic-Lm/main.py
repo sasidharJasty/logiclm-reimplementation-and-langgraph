@@ -261,6 +261,21 @@ def solve(text, announce=True):
         f"Unknown reasoning approach: {approach}"
     )
 
+
+# Solve using the pipeline assigned by a dataset adapter.
+def solve_pipeline(text, pipeline):
+    solvers = {
+        "LP": formulate_logic_program,
+        "FOL": formulate_FOL_program,
+        "CSP": formulate_CSP_program,
+        "SAT": formulate_SAT_program,
+    }
+    try:
+        solver = solvers[pipeline]
+    except KeyError as exc:
+        raise ValueError(f"Unknown dataset pipeline: {pipeline}") from exc
+    return solver(text)
+
 # Loadprontoqa.
 def LoadProntoQA():
     import json
@@ -409,7 +424,7 @@ def run_real_dataset(dataset, split="test", limit=1):
     results = []
     for record in records:
         try:
-            result = solve(record["text"])
+            result = solve_pipeline(record["text"], record["pipeline"])
             results.append({"id": record["id"], "expected": record["expected"], "result": result})
         except Exception as exc:
             results.append({"id": record["id"], "expected": record["expected"], "error": str(exc)})
@@ -548,7 +563,7 @@ def test_merged_dataset(path=None, execute=False, limit=None, metrics=False, pro
     total = len(records)
     for index, record in enumerate(records, 1):
         try:
-            result = solve(record["text"], announce=False)
+            result = solve_pipeline(record["text"], record["pipeline"])
             execution.append({
                 "id": record["id"],
                 "dataset": record["dataset"],
