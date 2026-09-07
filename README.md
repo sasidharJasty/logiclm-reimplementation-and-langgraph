@@ -13,7 +13,7 @@ From the workspace root:
 source env/bin/activate
 ```
 
-For Logic-LM, install the SAT dependency:
+For Logic-LM, install the dependencies:
 
 ```bash
 cd Logic-Lm
